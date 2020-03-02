@@ -15,7 +15,7 @@ import (
 	"github.com/syndtr/goleveldb/leveldb"
 
 	ds "github.com/ipfs/go-datastore"
-	"github.com/ipfs/go-ipfs-addr"
+	ipfsaddr "github.com/ipfs/go-ipfs-addr"
 	logging "github.com/ipfs/go-log"
 	libp2p "github.com/libp2p/go-libp2p"
 	host "github.com/libp2p/go-libp2p-host"
@@ -25,6 +25,8 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 	mh "github.com/multiformats/go-multihash"
 )
+
+const CRAWL_PERIOD = time.Second * 60
 
 var (
 	node_counts_g = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -54,6 +56,22 @@ var (
 		Subsystem: "stats",
 		Namespace: "libp2p",
 		Help:      "address counts discovered by the dht crawls",
+	})
+
+	query_lifetime_h = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:      "lifetime",
+		Subsystem: "dht",
+		Namespace: "libp2p",
+		Help:      "how long dht servers remain online",
+		Buckets:   []float64{1, 5, 15, 60, 60 * 5, 60 * 15, 3600, 3600 * 2, 3600 * 4, 3600 * 12, 3600 * 24, 3600 * 48, 3600 * 72, 3600 * 24 * 7, 3600 * 24 * 14, 3600 * 24 * 30},
+	})
+
+	query_offtime_h = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:      "offtime",
+		Subsystem: "dht",
+		Namespace: "libp2p",
+		Help:      "how long servers stay offline before coming back",
+		Buckets:   []float64{1, 5, 15, 60, 60 * 5, 60 * 15, 3600, 3600 * 2, 3600 * 4, 3600 * 12, 3600 * 24, 3600 * 48, 3600 * 72, 3600 * 24 * 7, 3600 * 24 * 14, 3600 * 24 * 30},
 	})
 )
 
@@ -121,18 +139,32 @@ func main() {
 	}
 	defer db.Close()
 
+	var churnDB *leveldb.DB
+
+	// TODO: add in a real args parser once complexity warrants it.
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "--no-churn" {
+		fmt.Printf("Skipping Churn counts")
+	} else {
+		churnDB, err = leveldb.OpenFile("churndata", nil)
+		if err != nil {
+			panic(err)
+		}
+		defer churnDB.Close()
+	}
+
 	if err := getStats(db); err != nil {
 		log.Error("get stats failed: ", err)
 	}
 
 	for {
-		if err := buildHostAndScrapePeers(db); err != nil {
+		if err := buildHostAndScrapePeers(db, churnDB); err != nil {
 			log.Error("scrape failed: ", err)
 		}
 	}
 }
 
-func buildHostAndScrapePeers(db *leveldb.DB) error {
+func buildHostAndScrapePeers(db *leveldb.DB, churnDB *leveldb.DB) error {
 	fmt.Println("building new node to collect metrics with")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -151,14 +183,12 @@ func buildHostAndScrapePeers(db *leveldb.DB) error {
 
 	bootstrap(ctx, h)
 
-	fmt.Println("starting new scrape round...")
-	for i := 0; i < 15; i++ {
-		if err := scrapePeers(db, h, mdht); err != nil {
+	for {
+		if err := scrapePeers(db, churnDB, h, mdht); err != nil {
 			return err
 		}
-		time.Sleep(time.Second * 10)
+		time.Sleep(CRAWL_PERIOD)
 	}
-	return nil
 }
 
 func getRandomString() string {
@@ -179,6 +209,15 @@ type trackingInfo struct {
 	Sightings     int       `json:"n"`
 	AgentVersion  string    `json:"av"`
 	Protocols     []string  `json:"ps"`
+}
+
+type churnAddr []churnInfo
+
+type churnInfo struct {
+	PeerID       string        `json:"p"`
+	FirstSeen    time.Time     `json:"fs"`
+	Lifetime     time.Duration `json:"d"`
+	failedScrape bool          `json:"d"`
 }
 
 func getStats(db *leveldb.DB) error {
@@ -255,7 +294,16 @@ func bootstrap(ctx context.Context, h host.Host) {
 	wg.Wait()
 }
 
-func scrapePeers(db *leveldb.DB, h host.Host, mdht *dht.IpfsDHT) error {
+func has(s string, l []string) bool {
+	for _, m := range l {
+		if s == m {
+			return true
+		}
+	}
+	return false
+}
+
+func scrapePeers(db *leveldb.DB, churnDB *leveldb.DB, h host.Host, mdht *dht.IpfsDHT) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -309,6 +357,15 @@ func scrapePeers(db *leveldb.DB, h host.Host, mdht *dht.IpfsDHT) error {
 		connected[c.RemotePeer()] = true
 	}
 
+	var churnTX *leveldb.Transaction
+	if churnDB != nil {
+		var err error
+		churnTX, err = churnDB.OpenTransaction()
+		if err != nil {
+			return err
+		}
+	}
+
 	tx, err := db.OpenTransaction()
 	if err != nil {
 		return err
@@ -342,9 +399,55 @@ func scrapePeers(db *leveldb.DB, h host.Host, mdht *dht.IpfsDHT) error {
 		}
 		pstat.LastSeen = now
 
+		cutoff := time.Now().Add(-3 * CRAWL_PERIOD)
 		addrs := h.Peerstore().Addrs(p)
+		prevAddrs := pstat.Addresses
 		pstat.Addresses = nil // reset
 		for _, a := range addrs {
+			var addrChurnStat churnAddr
+			cur, err := churnTX.Get([]byte(a.String()), nil)
+			if err == nil {
+				err = json.Unmarshal(cur, addrChurnStat)
+			}
+
+			found := false
+			if has(a.String(), prevAddrs) {
+				// see if there's a non-dead entry to extend.
+				for _, ac := range addrChurnStat {
+					if ac.PeerID == p.String() && !ac.failedScrape {
+						ac.Lifetime = time.Since(ac.FirstSeen)
+						found = true
+						break
+					}
+				}
+			}
+
+			if !found {
+				// kill entries where:
+				// a. it's this peer, where we saw them at a point where they weren't advertising this IP
+				// b. the lifetime of ost recent tme seen is long enough ago that we should have crawled / foudn this to update it.
+				for _, ac := range addrChurnStat {
+					if !ac.failedScrape && (ac.FirstSeen.Add(ac.Lifetime).Before(cutoff) ||
+						ac.PeerID == p.String()) {
+						ac.failedScrape = true
+					}
+				}
+				addrChurnStat = append(addrChurnStat, churnInfo{
+					PeerID:       p.String(),
+					FirstSeen:    time.Now(),
+					Lifetime:     0,
+					failedScrape: false,
+				})
+			}
+			data, err := json.Marshal(addrChurnStat)
+			if err != nil {
+				log.Error("failed to json marshal addrChurnStat: ", err)
+				continue
+			}
+			if err := churnTX.Put([]byte(a.String()), data, nil); err != nil {
+				log.Error("failed to write to leveldb: ", err)
+				continue
+			}
 			pstat.Addresses = append(pstat.Addresses, a.String())
 		}
 		av, err := h.Peerstore().Get(p, "AgentVersion")
@@ -368,6 +471,12 @@ func scrapePeers(db *leveldb.DB, h host.Host, mdht *dht.IpfsDHT) error {
 	}
 	if err := tx.Commit(); err != nil {
 		log.Error("failed to commit update transaction: ", err)
+	}
+
+	if churnTX != nil {
+		if err := churnTX.Commit(); err != nil {
+			log.Error("failed to commit update transaction: ", err)
+		}
 	}
 
 	fmt.Printf("updating stats took %s\n", time.Since(now))
