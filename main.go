@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/syndtr/goleveldb/leveldb"
 
+	badger "github.com/dgraph-io/badger/v2"
 	ds "github.com/ipfs/go-datastore"
 	ipfsaddr "github.com/ipfs/go-ipfs-addr"
 	logging "github.com/ipfs/go-log"
@@ -133,20 +134,20 @@ func main() {
 		}
 	}()
 
-	db, err := leveldb.OpenFile("netdata", nil)
+	db, err := badger.Open(badger.DefaultOptions("netdata"))
 	if err != nil {
 		panic(err)
 	}
 	defer db.Close()
 
-	var churnDB *leveldb.DB
+	var churnDB *badger.DB
 
 	// TODO: add in a real args parser once complexity warrants it.
 	args := os.Args[1:]
 	if len(args) > 0 && args[0] == "--no-churn" {
 		fmt.Printf("Skipping Churn counts")
 	} else {
-		churnDB, err = leveldb.OpenFile("churndata", nil)
+		churnDB, err = badger.Open(badger.DefaultOptions("churndata"))
 		if err != nil {
 			panic(err)
 		}
@@ -164,7 +165,7 @@ func main() {
 	}
 }
 
-func buildHostAndScrapePeers(db *leveldb.DB, churnDB *leveldb.DB) error {
+func buildHostAndScrapePeers(db *badger.DB, churnDB *badger.DB) error {
 	fmt.Println("building new node to collect metrics with")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -220,7 +221,7 @@ type churnInfo struct {
 	failedScrape bool          `json:"d"`
 }
 
-func getStats(db *leveldb.DB) error {
+func getStats(db *badger.DB) error {
 	now := time.Now()
 
 	protosCountDay := make(map[string]int)
@@ -230,14 +231,18 @@ func getStats(db *leveldb.DB) error {
 	var dayPeerCount int
 	var hourPeerCount int
 
-	iter := db.NewIterator(nil, nil)
-	defer iter.Release()
+	iterTx := db.NewTransaction(false)
+	defer iterTx.Discard()
+	iter := iterTx.NewIterator(badger.DefaultIteratorOptions)
+	defer iter.Close()
 
-	for iter.Next() {
-		pid := peer.ID(iter.Key())
+	for iter.Rewind(); iter.Valid(); iter.Next() {
+		item := iter.Item()
+		pid := peer.ID(item.Key())
+		val, _ := item.ValueCopy(nil)
 
 		var ti trackingInfo
-		err := json.Unmarshal(iter.Value(), &ti)
+		err := json.Unmarshal(val, &ti)
 		if err != nil {
 			log.Error("invalid json in leveldb for peer: ", pid.Pretty())
 			continue
@@ -303,7 +308,7 @@ func has(s string, l []string) bool {
 	return false
 }
 
-func scrapePeers(db *leveldb.DB, churnDB *leveldb.DB, h host.Host, mdht *dht.IpfsDHT) error {
+func scrapePeers(db *badger.DB, churnDB *badger.DB, h host.Host, mdht *dht.IpfsDHT) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -357,19 +362,12 @@ func scrapePeers(db *leveldb.DB, churnDB *leveldb.DB, h host.Host, mdht *dht.Ipf
 		connected[c.RemotePeer()] = true
 	}
 
-	var churnTX *leveldb.Transaction
+	var churnTX *badger.Txn
 	if churnDB != nil {
-		var err error
-		churnTX, err = churnDB.OpenTransaction()
-		if err != nil {
-			return err
-		}
+		churnTX = churnDB.NewTransaction(true)
 	}
 
-	tx, err := db.OpenTransaction()
-	if err != nil {
-		return err
-	}
+	tx := db.NewTransaction(true)
 
 	now := time.Now()
 	var pstat *trackingInfo
@@ -377,7 +375,7 @@ func scrapePeers(db *leveldb.DB, churnDB *leveldb.DB, h host.Host, mdht *dht.Ipf
 		if p == h.ID() {
 			continue
 		}
-		val, err := db.Get([]byte(p), nil)
+		val, err := tx.Get([]byte(p))
 		switch err {
 		case leveldb.ErrNotFound:
 			pstat = &trackingInfo{
@@ -387,8 +385,10 @@ func scrapePeers(db *leveldb.DB, churnDB *leveldb.DB, h host.Host, mdht *dht.Ipf
 			log.Error("getting data from leveldb: ", err)
 			continue
 		case nil:
+			valdat, _ := val.ValueCopy(nil)
+
 			pstat = new(trackingInfo)
-			if err := json.Unmarshal(val, pstat); err != nil {
+			if err = json.Unmarshal(valdat, pstat); err != nil {
 				log.Error("leveldb had bad json data: ", err)
 			}
 		}
@@ -405,9 +405,10 @@ func scrapePeers(db *leveldb.DB, churnDB *leveldb.DB, h host.Host, mdht *dht.Ipf
 		pstat.Addresses = nil // reset
 		for _, a := range addrs {
 			var addrChurnStat churnAddr
-			cur, err := churnTX.Get([]byte(a.String()), nil)
+			cur, err := churnTX.Get([]byte(a.String()))
 			if err == nil {
-				err = json.Unmarshal(cur, addrChurnStat)
+				curDat, _ := cur.ValueCopy(nil)
+				err = json.Unmarshal(curDat, addrChurnStat)
 			}
 
 			found := false
@@ -444,7 +445,7 @@ func scrapePeers(db *leveldb.DB, churnDB *leveldb.DB, h host.Host, mdht *dht.Ipf
 				log.Error("failed to json marshal addrChurnStat: ", err)
 				continue
 			}
-			if err := churnTX.Put([]byte(a.String()), data, nil); err != nil {
+			if err := churnTX.Set([]byte(a.String()), data); err != nil {
 				log.Error("failed to write to leveldb: ", err)
 				continue
 			}
@@ -464,7 +465,7 @@ func scrapePeers(db *leveldb.DB, churnDB *leveldb.DB, h host.Host, mdht *dht.Ipf
 			log.Error("failed to json marshal pstat: ", err)
 			continue
 		}
-		if err := tx.Put([]byte(p), data, nil); err != nil {
+		if err := tx.Set([]byte(p), data); err != nil {
 			log.Error("failed to write to leveldb: ", err)
 			continue
 		}

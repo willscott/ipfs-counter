@@ -3,6 +3,7 @@ module github.com/whyrusleeping/ipfs-counter
 go 1.13
 
 require (
+	github.com/dgraph-io/badger/v2 v2.0.2
 	github.com/ipfs/go-datastore v0.4.2
 	github.com/ipfs/go-ipfs-addr v0.0.1
 	github.com/ipfs/go-log v1.0.2
