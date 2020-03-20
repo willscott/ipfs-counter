@@ -217,7 +217,7 @@ type churnInfo struct {
 	PeerID       string        `json:"p"`
 	FirstSeen    time.Time     `json:"fs"`
 	Lifetime     time.Duration `json:"d"`
-	failedScrape bool          `json:"f"`
+	failedScrape bool
 }
 
 func getStats(db *badger.DB) error {
@@ -407,7 +407,7 @@ func scrapePeers(db *badger.DB, churnDB *badger.DB, h host.Host, mdht *dht.IpfsD
 			cur, err := churnTX.Get([]byte(a.String()))
 			if err == nil {
 				curDat, _ := cur.ValueCopy(nil)
-				err = json.Unmarshal(curDat, addrChurnStat)
+				err = json.Unmarshal(curDat, &addrChurnStat)
 			}
 
 			found := false
