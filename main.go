@@ -12,7 +12,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/syndtr/goleveldb/leveldb"
 
 	badger "github.com/dgraph-io/badger/v2"
 	ds "github.com/ipfs/go-datastore"
@@ -377,7 +376,7 @@ func scrapePeers(db *badger.DB, churnDB *badger.DB, h host.Host, mdht *dht.IpfsD
 		}
 		val, err := tx.Get([]byte(p))
 		switch err {
-		case leveldb.ErrNotFound:
+		case badger.ErrKeyNotFound:
 			pstat = &trackingInfo{
 				FirstSeen: now,
 			}

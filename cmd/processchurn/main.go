@@ -1,4 +1,4 @@
-package processchurn
+package main
 
 import (
 	"encoding/json"
