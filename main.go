@@ -218,7 +218,7 @@ type churnInfo struct {
 	PeerID       string        `json:"p"`
 	FirstSeen    time.Time     `json:"fs"`
 	Lifetime     time.Duration `json:"d"`
-	failedScrape bool          `json:"d"`
+	failedScrape bool          `json:"f"`
 }
 
 func getStats(db *badger.DB) error {

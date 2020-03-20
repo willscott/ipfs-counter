@@ -22,6 +22,7 @@ require (
 	github.com/multiformats/go-multiaddr v0.2.0
 	github.com/multiformats/go-multihash v0.0.13
 	github.com/prometheus/client_golang v1.4.1
+	github.com/spf13/pflag v1.0.3
 	github.com/syndtr/goleveldb v1.0.0
 	github.com/whyrusleeping/go-smux-multiplex v3.0.16+incompatible // indirect
 	github.com/whyrusleeping/go-smux-multistream v2.0.2+incompatible // indirect
