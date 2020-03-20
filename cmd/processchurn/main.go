@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/dgraph-io/badger"
 	"github.com/dgraph-io/badger/v2"
 	"github.com/spf13/pflag"
 )
@@ -47,6 +48,9 @@ func main() {
 		if churn.FirstSeen.Add(churn.Lifetime).Before(windowStart) {
 			return nil
 		}
+		if _, ok := mapByPeer[churn.PeerID]; !ok {
+			mapByPeer[churn.PeerID] = make([]*churnInfo, 1)
+		}
 		mapByPeer[churn.PeerID] = append(mapByPeer[churn.PeerID], churn)
 		return nil
 	}
@@ -59,6 +63,7 @@ func main() {
 		itm := iter.Item()
 		itm.Value(putInMap)
 	}
+	iter.Close()
 
 	fmt.Printf("Saw %d peers.\n", len(mapByPeer))
 }
