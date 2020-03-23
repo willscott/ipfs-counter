@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/VividCortex/gohistogram"
 	"github.com/dgraph-io/badger/v2"
 	"github.com/spf13/pflag"
 )
@@ -38,6 +39,12 @@ func main() {
 	mapByPeer := make(map[string][]*churnInfo)
 	windowStart := time.Now().Add(*window * time.Duration(-1))
 
+	nz := 0
+	nzd := 0
+
+	peersPerAddr := gohistogram.NewHistogram(50)
+	peerLifetime := gohistogram.NewHistogram(50)
+
 	putInMap := func(key string) func(val []byte) error {
 		return func(val []byte) error {
 			churn := make([]churnInfo, 0)
@@ -46,7 +53,14 @@ func main() {
 				return err
 			}
 
+			uniqPeers := make(map[string]bool)
 			for _, peer := range churn {
+				uniqPeers[peer.PeerID] = true
+				nzd++
+				if peer.Lifetime > 0 {
+					nz++
+				}
+				peerLifetime.Add(float64(peer.Lifetime))
 				if peer.FirstSeen.Add(peer.Lifetime).Before(windowStart) {
 					return nil
 				}
@@ -56,6 +70,7 @@ func main() {
 				peer.address = key
 				mapByPeer[peer.PeerID] = append(mapByPeer[peer.PeerID], &peer)
 			}
+			peersPerAddr.Add(float64(len(uniqPeers)))
 			return nil
 		}
 	}
@@ -70,6 +85,10 @@ func main() {
 		itm.Value(putInMap(k))
 	}
 	iter.Close()
+	nzp := float64(nz) / float64(nzd)
 
 	fmt.Printf("Saw %d peers.\n", len(mapByPeer))
+	fmt.Printf("Number of non-0 lifetimes: %d (%f)\n", nz, nzp)
+	fmt.Printf("histogram of peer Lifetimes:\n%s\n", peerLifetime.String())
+	fmt.Printf("histogram of peers per address:\n%s\n", peersPerAddr.String())
 }
