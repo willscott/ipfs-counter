@@ -11,10 +11,10 @@ import (
 
 // a DB entry
 type churnInfo struct {
-	PeerID       string        `json:"p"`
-	FirstSeen    time.Time     `json:"fs"`
-	Lifetime     time.Duration `json:"d"`
-	failedScrape bool          `json:"f"`
+	PeerID    string        `json:"p"`
+	FirstSeen time.Time     `json:"fs"`
+	Lifetime  time.Duration `json:"d"`
+	address   string
 }
 
 var window *time.Duration = pflag.DurationP("window", "w", time.Hour*24*7, "window to track over")
@@ -38,38 +38,26 @@ func main() {
 	mapByPeer := make(map[string][]*churnInfo)
 	windowStart := time.Now().Add(*window * time.Duration(-1))
 
-	putInMap := func(val []byte) error {
-		churn := make(map[string]interface{})
-		err := json.Unmarshal(val, &churn)
-		if err != nil {
-			return err
-		}
-		lt := time.Duration(0)
-		fs := time.Time{}
-		pid := ""
-		if lx, ok := churn["d"]; ok {
-			lt = lx.(time.Duration)
-		} else {
+	putInMap := func(key string) func(val []byte) error {
+		return func(val []byte) error {
+			churn := make([]churnInfo, 0)
+			err := json.Unmarshal(val, &churn)
+			if err != nil {
+				return err
+			}
+
+			for _, peer := range churn {
+				if peer.FirstSeen.Add(peer.Lifetime).Before(windowStart) {
+					return nil
+				}
+				if _, ok := mapByPeer[peer.PeerID]; !ok {
+					mapByPeer[peer.PeerID] = make([]*churnInfo, 1)
+				}
+				peer.address = key
+				mapByPeer[peer.PeerID] = append(mapByPeer[peer.PeerID], &peer)
+			}
 			return nil
 		}
-		if fx, ok := churn["fs"]; ok {
-			fs = fx.(time.Time)
-		} else {
-			return nil
-		}
-		if px, ok := churn["p"]; ok {
-			pid = px.(string)
-		} else {
-			return nil
-		}
-		if fs.Add(lt).Before(windowStart) {
-			return nil
-		}
-		if _, ok := mapByPeer[pid]; !ok {
-			mapByPeer[pid] = make([]*churnInfo, 1)
-		}
-		mapByPeer[pid] = append(mapByPeer[pid], &churnInfo{PeerID: pid, FirstSeen: fs, Lifetime: lt})
-		return nil
 	}
 
 	// pull into memory
@@ -78,7 +66,8 @@ func main() {
 	iter := tx.NewIterator(badger.DefaultIteratorOptions)
 	for iter.Rewind(); iter.Valid(); iter.Next() {
 		itm := iter.Item()
-		itm.Value(putInMap)
+		k := string(itm.Key())
+		itm.Value(putInMap(k))
 	}
 	iter.Close()
 
