@@ -39,18 +39,36 @@ func main() {
 	windowStart := time.Now().Add(*window * time.Duration(-1))
 
 	putInMap := func(val []byte) error {
-		churn := new(churnInfo)
-		err := json.Unmarshal(val, churn)
+		churn := make(map[string]interface{})
+		err := json.Unmarshal(val, &churn)
 		if err != nil {
 			return err
 		}
-		if churn.FirstSeen.Add(churn.Lifetime).Before(windowStart) {
+		lt := time.Duration(0)
+		fs := time.Time{}
+		pid := ""
+		if lx, ok := churn["d"]; ok {
+			lt = lx.(time.Duration)
+		} else {
 			return nil
 		}
-		if _, ok := mapByPeer[churn.PeerID]; !ok {
-			mapByPeer[churn.PeerID] = make([]*churnInfo, 1)
+		if fx, ok := churn["fs"]; ok {
+			fs = fx.(time.Time)
+		} else {
+			return nil
 		}
-		mapByPeer[churn.PeerID] = append(mapByPeer[churn.PeerID], churn)
+		if px, ok := churn["p"]; ok {
+			pid = px.(string)
+		} else {
+			return nil
+		}
+		if fs.Add(lt).Before(windowStart) {
+			return nil
+		}
+		if _, ok := mapByPeer[pid]; !ok {
+			mapByPeer[pid] = make([]*churnInfo, 1)
+		}
+		mapByPeer[pid] = append(mapByPeer[pid], &churnInfo{PeerID: pid, FirstSeen: fs, Lifetime: lt})
 		return nil
 	}
 
