@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,20 +12,22 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	badger "github.com/dgraph-io/badger/v2"
 	ds "github.com/ipfs/go-datastore"
 	ipfsaddr "github.com/ipfs/go-ipfs-addr"
+	"github.com/ipfs/go-ipns"
 	logging "github.com/ipfs/go-log"
 	libp2p "github.com/libp2p/go-libp2p"
-	host "github.com/libp2p/go-libp2p-host"
+	host "github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/network"
+	peer "github.com/libp2p/go-libp2p-core/peer"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
-	peer "github.com/libp2p/go-libp2p-peer"
 	pstore "github.com/libp2p/go-libp2p-peerstore"
+	record "github.com/libp2p/go-libp2p-record"
 	ma "github.com/multiformats/go-multiaddr"
 	mh "github.com/multiformats/go-multihash"
 )
 
-const CRAWL_PERIOD = time.Second * 60
+const CRAWL_PERIOD = time.Second * 15
 
 var (
 	node_counts_g = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -86,14 +87,11 @@ var log = logging.Logger("dht_scrape")
 var bspi []pstore.PeerInfo
 
 var DefaultBootstrapAddresses = []string{
-	"/ip4/104.131.131.82/tcp/4001/ipfs/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",  // mars.i.ipfs.io
-	"/ip4/104.236.179.241/tcp/4001/ipfs/QmSoLPppuBtQSGwKDZT2M73ULpjvfd3aZ6ha4oFGL1KrGM", // pluto.i.ipfs.io
-	"/ip4/128.199.219.111/tcp/4001/ipfs/QmSoLSafTMBsPKadTEgaXctDQVcqN88CNLHXMkTNwMKPnu", // saturn.i.ipfs.io
-	"/ip4/104.236.76.40/tcp/4001/ipfs/QmSoLV4Bbm51jM9C4gDYZQ9Cy3U6aXMJDAbzgu2fzaDs64",   // venus.i.ipfs.io
-	"/ip4/178.62.158.247/tcp/4001/ipfs/QmSoLer265NRgSp2LA3dPaeykiS1J6DifTC88f5uVQKNAd",  // earth.i.ipfs.io
-	"/ip4/104.236.151.122/tcp/4001/ipfs/QmSoLju6m7xTh3DuokvT3886QRYqxAzb1kShaanJgW36yx",
-	"/ip4/188.40.114.11/tcp/4001/ipfs/QmZY7MtK8ZbG1suwrxc7xEYZ2hQLf1dAWPRHhjxC8rjq8E",
-	"/ip4/5.9.59.34/tcp/4001/ipfs/QmRv1GNseNP1krEwHDjaQMeQVJy41879QcDwpJVhY8SWve",
+	"/dns4/node0.preload.ipfs.io/tcp/4001/p2p/QmZMxNdpMkewiVZLMRxaNxUeZpDUb34pWjZ1kZvsd16Zic",
+	"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+	"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+	"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+	"/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
 }
 
 func init() {
@@ -133,38 +131,14 @@ func main() {
 		}
 	}()
 
-	db, err := badger.Open(badger.DefaultOptions("netdata"))
-	if err != nil {
-		panic(err)
-	}
-	defer db.Close()
-
-	var churnDB *badger.DB
-
-	// TODO: add in a real args parser once complexity warrants it.
-	args := os.Args[1:]
-	if len(args) > 0 && args[0] == "--no-churn" {
-		fmt.Printf("Skipping Churn counts")
-	} else {
-		churnDB, err = badger.Open(badger.DefaultOptions("churndata"))
-		if err != nil {
-			panic(err)
-		}
-		defer churnDB.Close()
-	}
-
-	if err := getStats(db); err != nil {
-		log.Error("get stats failed: ", err)
-	}
-
 	for {
-		if err := buildHostAndScrapePeers(db, churnDB); err != nil {
+		if err := buildHostAndScrapePeers(); err != nil {
 			log.Error("scrape failed: ", err)
 		}
 	}
 }
 
-func buildHostAndScrapePeers(db *badger.DB, churnDB *badger.DB) error {
+func buildHostAndScrapePeers() error {
 	fmt.Println("building new node to collect metrics with")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -179,16 +153,79 @@ func buildHostAndScrapePeers(db *badger.DB, churnDB *badger.DB) error {
 	}()
 
 	mds := ds.NewMapDatastore()
-	mdht := dht.NewDHT(ctx, h, mds)
+	mdht, err := dht.New(ctx, h,
+		dht.Datastore(mds),
+		dht.Mode(dht.ModeClient),
+		dht.Validator(record.NamespacedValidator{
+			"pk":   record.PublicKeyValidator{},
+			"ipns": ipns.Validator{KeyBook: h.Peerstore()}}))
+	if err != nil {
+		panic(err)
+	}
 
 	bootstrap(ctx, h)
 
-	for {
-		if err := scrapePeers(db, churnDB, h, mdht); err != nil {
-			return err
+	knownPeers := make(map[peer.ID]*trackingInfo)
+	seen := 0
+	newSeen := 0
+	kpl := sync.Mutex{}
+
+	ectx, evch := dht.RegisterForLookupEvents(ctx)
+	go func() {
+		for {
+			select {
+			case <-ectx.Done():
+				return
+			case le := <-evch:
+				kpl.Lock()
+				for _, heardPeer := range le.Response.Heard {
+					seen++
+					t, ok := knownPeers[heardPeer.Peer]
+					if !ok {
+						newSeen++
+						t = new(trackingInfo)
+						knownPeers[heardPeer.Peer] = t
+					}
+					t.LastSeen = time.Now()
+				}
+				kpl.Unlock()
+			}
 		}
+	}()
+
+	prevSeen := 0
+	prevNew := 0
+	for {
+		pokeDHT(ctx, mdht)
+		kpl.Lock()
+		// go until a process of poking 1000 peers results in finding less than 50 new ones.
+		if seen-prevSeen > 1000 {
+			fmt.Printf("new rate is %f\n", float64(newSeen-prevNew)/float64(seen-prevSeen))
+			if float64(newSeen-prevNew)/float64(seen-prevSeen) < 0.05 {
+				kpl.Unlock()
+				break
+			}
+			prevSeen = seen
+			prevNew = newSeen
+		}
+		kpl.Unlock()
 		time.Sleep(CRAWL_PERIOD)
 	}
+	fmt.Printf("through the DHT, learned about %d peers\n", seen)
+	if err := scrapePeers(h, mdht, knownPeers); err != nil {
+		return err
+	}
+	return nil
+}
+
+func pokeDHT(ctx context.Context, mdht *dht.IpfsDHT) bool {
+	wg := sync.WaitGroup{}
+	for i := 0; i < 15; i++ {
+		wg.Add(1)
+		go scrapeRound(ctx, &wg, mdht, getRandomString())
+	}
+	wg.Wait()
+	return true
 }
 
 func getRandomString() string {
@@ -209,77 +246,6 @@ type trackingInfo struct {
 	Sightings     int       `json:"n"`
 	AgentVersion  string    `json:"av"`
 	Protocols     []string  `json:"ps"`
-}
-
-type churnAddr []churnInfo
-
-type churnInfo struct {
-	PeerID       string        `json:"p"`
-	FirstSeen    time.Time     `json:"fs"`
-	Lifetime     time.Duration `json:"d"`
-	failedScrape bool
-}
-
-func getStats(db *badger.DB) error {
-	now := time.Now()
-
-	protosCountDay := make(map[string]int)
-	protosCountHour := make(map[string]int)
-	dayVersCount := make(map[string]int)
-	hourVersCount := make(map[string]int)
-	var dayPeerCount int
-	var hourPeerCount int
-
-	iterTx := db.NewTransaction(false)
-	defer iterTx.Discard()
-	iter := iterTx.NewIterator(badger.DefaultIteratorOptions)
-	defer iter.Close()
-
-	for iter.Rewind(); iter.Valid(); iter.Next() {
-		item := iter.Item()
-		pid := peer.ID(item.Key())
-		val, _ := item.ValueCopy(nil)
-
-		var ti trackingInfo
-		err := json.Unmarshal(val, &ti)
-		if err != nil {
-			log.Error("invalid json in leveldb for peer: ", pid.Pretty())
-			continue
-		}
-
-		age := now.Sub(ti.LastSeen)
-		if age <= time.Hour*24 {
-			dayVersCount[ti.AgentVersion]++
-			dayPeerCount++
-
-			for _, p := range ti.Protocols {
-				protosCountDay[p]++
-			}
-		}
-		if age <= time.Hour {
-			hourVersCount[ti.AgentVersion]++
-			hourPeerCount++
-			for _, p := range ti.Protocols {
-				protosCountHour[p]++
-			}
-		}
-
-	}
-
-	for k, v := range dayVersCount {
-		node_counts_g.WithLabelValues("day", k).Set(float64(v))
-	}
-	for k, v := range hourVersCount {
-		node_counts_g.WithLabelValues("hour", k).Set(float64(v))
-	}
-	for k, v := range protosCountDay {
-		protocols_g.WithLabelValues("day", k).Set(float64(v))
-	}
-	for k, v := range protosCountHour {
-		protocols_g.WithLabelValues("hour", k).Set(float64(v))
-	}
-
-	return nil
 }
 
 // bootstrap (TODO: choose from larger group of peers)
@@ -307,183 +273,123 @@ func has(s string, l []string) bool {
 	return false
 }
 
-func scrapePeers(db *badger.DB, churnDB *badger.DB, h host.Host, mdht *dht.IpfsDHT) error {
+func scrapeRound(ctx context.Context, wg *sync.WaitGroup, mdht *dht.IpfsDHT, k string) {
+	mctx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
+	defer wg.Done()
+	defer fmt.Print(".")
+
+	start := time.Now()
+	peers, err := mdht.GetClosestPeers(mctx, k)
+	if err != nil {
+		log.Error(err)
+		return
+	}
+
+	done := false
+	for !done {
+		select {
+		case _, ok := <-peers:
+			if !ok {
+				done = true
+			}
+		case <-mctx.Done():
+			done = true
+		}
+	}
+	took := time.Since(start).Seconds()
+	query_lat_h.Observe(took)
+}
+
+func peerFinder(ctx context.Context, dht *dht.IpfsDHT, ids chan peer.ID, infos chan peer.AddrInfo, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case p, ok := <-ids:
+			if !ok {
+				return
+			}
+			info, err := dht.FindPeer(ctx, p)
+			if err != nil {
+				infos <- info
+			}
+		}
+	}
+}
+
+func connector(ctx context.Context, h host.Host, infos chan peer.AddrInfo, versions chan string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case i, ok := <-infos:
+			if !ok {
+				return
+			}
+			err := h.Connect(ctx, i)
+			if err != nil {
+				continue
+			}
+			if h.Network().Connectedness(i.ID) == network.Connected {
+				av, _ := h.Peerstore().Get(i.ID, "AgentVersion")
+				versions <- fmt.Sprint(av)
+			}
+		}
+	}
+}
+
+// peerID -> dht.FindPeer -> network.Connect
+func scrapePeers(h host.Host, dht *dht.IpfsDHT, peers map[peer.ID]*trackingInfo) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var wg sync.WaitGroup
-	rlim := make(chan struct{}, 10)
-	fmt.Printf("scraping")
-	scrapeRound := func(k string) {
-		mctx, cancel := context.WithTimeout(ctx, time.Second*30)
-		defer cancel()
-		defer wg.Done()
-		defer fmt.Print(".")
-		rlim <- struct{}{}
-		defer func() {
-			<-rlim
-		}()
-
-		start := time.Now()
-		peers, err := mdht.GetClosestPeers(mctx, k)
-		if err != nil {
-			log.Error(err)
-			return
-		}
-
-		done := false
-		for !done {
-			select {
-			case _, ok := <-peers:
-				if !ok {
-					done = true
-				}
-			case <-mctx.Done():
-				done = true
-			}
-		}
-		took := time.Since(start).Seconds()
-		query_lat_h.Observe(took)
-	}
-
+	pc := make(chan peer.ID, 30)
+	pcw := sync.WaitGroup{}
+	ic := make(chan peer.AddrInfo, 30)
+	icw := sync.WaitGroup{}
+	vc := make(chan string, 30)
+	pcw.Add(15)
+	icw.Add(15)
 	for i := 0; i < 15; i++ {
-		wg.Add(1)
-		go scrapeRound(getRandomString())
-	}
-	wg.Wait()
-	fmt.Println("done!")
-
-	peers := h.Peerstore().Peers()
-	conns := h.Network().Conns()
-
-	connected := make(map[peer.ID]bool)
-	for _, c := range conns {
-		connected[c.RemotePeer()] = true
+		go peerFinder(ctx, dht, pc, ic, &pcw)
+		go connector(ctx, h, ic, vc, &icw)
 	}
 
-	var churnTX *badger.Txn
-	if churnDB != nil {
-		churnTX = churnDB.NewTransaction(true)
-	}
-
-	tx := db.NewTransaction(true)
-
-	now := time.Now()
-	var pstat *trackingInfo
-	for _, p := range peers {
-		if p == h.ID() {
-			continue
-		}
-		val, err := tx.Get([]byte(p))
-		switch err {
-		case badger.ErrKeyNotFound:
-			pstat = &trackingInfo{
-				FirstSeen: now,
-			}
-		default:
-			log.Error("getting data from leveldb: ", err)
-			continue
-		case nil:
-			valdat, _ := val.ValueCopy(nil)
-
-			pstat = new(trackingInfo)
-			if err = json.Unmarshal(valdat, pstat); err != nil {
-				log.Error("leveldb had bad json data: ", err)
-			}
-		}
-
-		pstat.Sightings++
-		if connected[p] {
-			pstat.LastConnected = now
-		}
-		pstat.LastSeen = now
-
-		cutoff := time.Now().Add(-3 * CRAWL_PERIOD)
-		addrs := h.Peerstore().Addrs(p)
-		prevAddrs := pstat.Addresses
-		pstat.Addresses = nil // reset
-		for _, a := range addrs {
-			var addrChurnStat churnAddr
-			cur, err := churnTX.Get([]byte(a.String()))
-			if err == nil {
-				curDat, _ := cur.ValueCopy(nil)
-				err = json.Unmarshal(curDat, &addrChurnStat)
-			}
-
-			found := false
-			if has(a.String(), prevAddrs) {
-				// see if there's a non-dead entry to extend.
-				for _, ac := range addrChurnStat {
-					if ac.PeerID == p.String() && !ac.failedScrape {
-						ac.Lifetime = time.Since(ac.FirstSeen)
-						found = true
-						break
-					}
+	vmap := make(map[string]int)
+	go func() {
+		for {
+			select {
+			case v, ok := <-vc:
+				if !ok {
+					return
 				}
+				vmap[v]++
 			}
+		}
+	}()
 
-			if !found {
-				// kill entries where:
-				// a. it's this peer, where we saw them at a point where they weren't advertising this IP
-				// b. the lifetime of ost recent tme seen is long enough ago that we should have crawled / foudn this to update it.
-				for _, ac := range addrChurnStat {
-					if !ac.failedScrape && (ac.FirstSeen.Add(ac.Lifetime).Before(cutoff) ||
-						ac.PeerID == p.String()) {
-						ac.failedScrape = true
-					}
-				}
-				addrChurnStat = append(addrChurnStat, churnInfo{
-					PeerID:       p.String(),
-					FirstSeen:    time.Now(),
-					Lifetime:     0,
-					failedScrape: false,
-				})
-			}
-			data, err := json.Marshal(addrChurnStat)
-			if err != nil {
-				log.Error("failed to json marshal addrChurnStat: ", err)
-				continue
-			}
-			if err := churnTX.Set([]byte(a.String()), data); err != nil {
-				log.Error("failed to write to leveldb: ", err)
-				continue
-			}
-			pstat.Addresses = append(pstat.Addresses, a.String())
-		}
-		av, err := h.Peerstore().Get(p, "AgentVersion")
-		if err == nil {
-			pstat.AgentVersion = fmt.Sprint(av)
-		}
-		protos, _ := h.Peerstore().GetProtocols(p)
-		if len(protos) != 0 {
-			pstat.Protocols = protos
-		}
-
-		data, err := json.Marshal(pstat)
-		if err != nil {
-			log.Error("failed to json marshal pstat: ", err)
-			continue
-		}
-		if err := tx.Set([]byte(p), data); err != nil {
-			log.Error("failed to write to leveldb: ", err)
-			continue
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		log.Error("failed to commit update transaction: ", err)
+	pl := len(peers)
+	for p := range peers {
+		pc <- p
 	}
 
-	if churnTX != nil {
-		if err := churnTX.Commit(); err != nil {
-			log.Error("failed to commit update transaction: ", err)
+	close(pc)
+	pcw.Wait()
+	close(ic)
+	icw.Wait()
+	close(vc)
+
+	cl := 0
+	for v, c := range vmap {
+		cl += c
+		if c > 100 {
+			fmt.Printf("%-15s\t%d\n", v, c)
 		}
 	}
-
-	fmt.Printf("updating stats took %s\n", time.Since(now))
-
-	if err := getStats(db); err != nil {
-		return err
-	}
+	fmt.Printf("%d of %d nodes connected.\n", pl, cl)
 
 	return nil
 }
